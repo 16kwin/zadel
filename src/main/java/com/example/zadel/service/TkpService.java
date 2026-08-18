@@ -1,4 +1,4 @@
-// ЗАДЕЛ — service/TkpService.java — ПОЛНЫЙ ФАЙЛ (добавлено сохранение статуса accept в OrderStatus)
+// ЗАДЕЛ — service/TkpService.java — ПОЛНЫЙ ФАЙЛ (добавлена отправка unaccept в SAAS)
 package com.example.zadel.service;
 
 import com.example.zadel.dto.*;
@@ -241,13 +241,11 @@ public class TkpService {
 
                 Map<String, Object> newProduct = new LinkedHashMap<>();
                 
-                // Сохраняем исходный product_uid из AWMS
                 newProduct.put("product_uid", productUid);
                 newProduct.put("quantity", quantity);
                 newProduct.put("price", price);
                 newProduct.put("cost", cost);
 
-                // Если есть zadelUid — подтягиваем данные из номенклатуры Zadel
                 if (zadelUid != null) {
                     newProduct.put("zadel_product_uid", zadelUid);
                     try {
@@ -263,7 +261,6 @@ public class TkpService {
                         newProduct.put("brand", material.getBrandName() != null ? material.getBrandName() : "");
                         newProduct.put("model", material.getModelOfBrandName() != null ? material.getModelOfBrandName() : "");
                     } catch (Exception e) {
-                        // Fallback — оставляем данные из AWMS
                         newProduct.put("product", awmsProduct.get("product"));
                         newProduct.put("article", awmsProduct.get("article"));
                         newProduct.put("description", awmsProduct.get("description"));
@@ -275,7 +272,6 @@ public class TkpService {
                         newProduct.put("model", awmsProduct.get("model"));
                     }
                 } else {
-                    // Нет замены — оставляем данные из AWMS
                     newProduct.put("product", awmsProduct.get("product"));
                     newProduct.put("article", awmsProduct.get("article"));
                     newProduct.put("description", awmsProduct.get("description"));
@@ -287,7 +283,6 @@ public class TkpService {
                     newProduct.put("model", awmsProduct.get("model"));
                 }
 
-                // Сохраняем изображения, чертежи, коды и т.д. из AWMS
                 if (awmsProduct.get("images") != null) newProduct.put("images", awmsProduct.get("images"));
                 if (awmsProduct.get("draws") != null) newProduct.put("draws", awmsProduct.get("draws"));
                 if (awmsProduct.get("barcode") != null) newProduct.put("barcode", awmsProduct.get("barcode"));
@@ -295,7 +290,6 @@ public class TkpService {
                 if (awmsProduct.get("specifications") != null) newProduct.put("specifications", awmsProduct.get("specifications"));
                 if (awmsProduct.get("analogues") != null) newProduct.put("analogues", awmsProduct.get("analogues"));
 
-                // Сохраняем релевантность
                 if (relevanceScores.containsKey(productUid)) {
                     newProduct.put("relevance", relevanceScores.get(productUid));
                 }
@@ -304,7 +298,6 @@ public class TkpService {
             }
         }
 
-        // Формируем итоговый JSON ТКП
         Map<String, Object> tkpData = new LinkedHashMap<>();
         tkpData.put("tkp_uid", tkpUid);
         tkpData.put("order_uid", orderUid);
@@ -335,6 +328,11 @@ public class TkpService {
                     .datetime(ZonedDateTime.now())
                     .build();
             tkpStatusRepository.save(tkpStatus);
+
+            // ОТПРАВЛЯЕМ unaccept В SAAS
+            Map<String, Object> invoiceBody = Map.of("statusinvoice", "unaccept");
+            HttpEntity<Map<String, Object>> invoiceEntity = new HttpEntity<>(invoiceBody, createJsonHeaders());
+            restTemplate.exchange(saasServiceUrl + "/v1/tkp/" + tkpUid + "/statusinvoice", HttpMethod.POST, invoiceEntity, String.class);
 
             Map<String, Object> reasonBody = Map.of("statusreason", "posttkpprovider");
             HttpEntity<Map<String, Object>> reasonEntity = new HttpEntity<>(reasonBody, createJsonHeaders());
