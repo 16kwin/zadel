@@ -1,4 +1,4 @@
-// ЗАДЕЛ — service/TkpService.java — ПОЛНЫЙ ФАЙЛ (добавлена отправка unaccept в SAAS)
+// ЗАДЕЛ — service/TkpService.java — ПОЛНЫЙ ФАЙЛ С ЛОГАМИ + order_number
 package com.example.zadel.service;
 
 import com.example.zadel.dto.*;
@@ -6,6 +6,7 @@ import com.example.zadel.model.*;
 import com.example.zadel.repository.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
@@ -19,6 +20,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class TkpService {
@@ -54,25 +56,37 @@ public class TkpService {
     }
 
     public List<Map<String, Object>> getOutgoingTkp() {
+        log.info("Zadel TkpService: getOutgoingTkp() вызван");
         return tkpListRepository.findByStatus("active")
                 .stream().map(this::toTkpListMap).collect(Collectors.toList());
     }
 
     public List<Map<String, Object>> getClosedTkp() {
+        log.info("Zadel TkpService: getClosedTkp() вызван");
         return tkpListRepository.findByStatus("closed")
                 .stream().map(this::toTkpListMap).collect(Collectors.toList());
     }
 
     public Optional<Map<String, Object>> getTkp(String tkpUid) {
+        log.info("Zadel TkpService: getTkp() вызван, tkpUid={}", tkpUid);
         Optional<TkpFull> fullOpt = tkpFullRepository.findByTkpUid(tkpUid);
         if (fullOpt.isPresent()) {
             try {
                 Map<String, Object> tkp = objectMapper.readValue(fullOpt.get().getTkpJson(), Map.class);
                 tkp.put("status", getLatestTkpStatus(tkpUid));
                 tkp.put("statusinvoice", getLatestStatusInvoice(tkpUid));
+                
+                // Добавляем номер заказа
+                String orderUid = (String) tkp.get("order_uid");
+                if (orderUid != null) {
+                    ordersListRepository.findById(orderUid).ifPresent(order -> {
+                        tkp.put("ordernumber", order.getOrderNumber());
+                    });
+                }
+                
                 return Optional.of(tkp);
             } catch (Exception e) {
-                e.printStackTrace();
+                log.error("Zadel TkpService: ошибка парсинга ТКП {}", tkpUid, e);
             }
         }
         return Optional.empty();
@@ -80,6 +94,7 @@ public class TkpService {
 
     @Transactional
     public void saveTkpLocally(String tkpUid, Map<String, Object> tkpData) {
+        log.info("Zadel TkpService: saveTkpLocally() вызван, tkpUid={}, statusinvoice={}", tkpUid, tkpData.get("statusinvoice"));
         TkpList tkpList = TkpList.builder()
                 .tkpUid(tkpUid)
                 .orderUid((String) tkpData.get("order_uid"))
@@ -103,12 +118,13 @@ public class TkpService {
                     .build();
             tkpFullRepository.save(tkpFull);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel TkpService: ошибка сохранения TkpFull {}", tkpUid, e);
         }
     }
 
     @Transactional
     public void receiveTkp(String tkpUid, Map<String, Object> request) {
+        log.info("Zadel TkpService: receiveTkp() вызван, tkpUid={}", tkpUid);
         saveTkpLocally(tkpUid, request);
 
         TkpStatus tkpStatus = TkpStatus.builder()
@@ -121,6 +137,7 @@ public class TkpService {
 
     @Transactional
     public void receiveTkpStatusUpdate(String tkpUid, String statusinvoice) {
+        log.info("Zadel TkpService: receiveTkpStatusUpdate() вызван, tkpUid={}, statusinvoice={}", tkpUid, statusinvoice);
         TkpStatus tkpStatus = TkpStatus.builder()
                 .tkpUid(tkpUid)
                 .subStatus(statusinvoice)
@@ -128,8 +145,8 @@ public class TkpService {
                 .build();
         tkpStatusRepository.save(tkpStatus);
 
-        // При подтверждении ТКП сохраняем статус в OrderStatus
         if ("accept".equals(statusinvoice)) {
+            log.info("Zadel TkpService: обрабатываю accept для tkpUid={}", tkpUid);
             tkpListRepository.findById(tkpUid).ifPresent(tkp -> {
                 String orderUid = tkp.getOrderUid();
                 if (orderUid != null) {
@@ -140,16 +157,19 @@ public class TkpService {
                             .datetime(ZonedDateTime.now())
                             .build();
                     orderStatusRepository.save(orderStatus);
+                    log.info("Zadel TkpService: OrderStatus accept сохранён, orderUid={}", orderUid);
                     
                     ordersListRepository.findById(orderUid).ifPresent(order -> {
                         order.setStatusreason("accept");
                         ordersListRepository.save(order);
+                        log.info("Zadel TkpService: OrdersList statusreason=accept, orderUid={}", orderUid);
                     });
                 }
             });
         }
 
         if ("inrealise".equals(statusinvoice)) {
+            log.info("Zadel TkpService: обрабатываю inrealise для tkpUid={}", tkpUid);
             tkpListRepository.findById(tkpUid).ifPresent(tkp -> {
                 String orderUid = tkp.getOrderUid();
                 if (orderUid != null) {
@@ -159,6 +179,7 @@ public class TkpService {
                             .datetime(ZonedDateTime.now())
                             .build();
                     orderTrackingRepository.save(tracking);
+                    log.info("Zadel TkpService: OrderTracking notinwork сохранён, orderUid={}", orderUid);
                 }
             });
         }
@@ -170,6 +191,7 @@ public class TkpService {
             if ("paid".equals(statusinvoice) || "unpaid".equals(statusinvoice) || 
                 "cancelprovider".equals(statusinvoice) || "cancelcustomer".equals(statusinvoice)) {
                 tkp.setStatus("closed");
+                log.info("Zadel TkpService: закрываю ТКП, tkpUid={}", tkpUid);
                 
                 if (orderUid != null) {
                     String orderSubStatus = "paid".equals(statusinvoice) ? "done" : statusinvoice;
@@ -195,20 +217,23 @@ public class TkpService {
     @SuppressWarnings("unchecked")
     @Transactional
     public Map<String, Object> sendTkp(String orderUid, Map<String, Object> request) {
+        log.info("Zadel TkpService: sendTkp() вызван, orderUid={}, request={}", orderUid, request);
         Optional<Map<String, Object>> orderOpt = orderService.getOrder(orderUid);
         if (orderOpt.isEmpty()) {
+            log.error("Zadel TkpService: заказ не найден: {}", orderUid);
             throw new RuntimeException("Заказ не найден: " + orderUid);
         }
 
         Map<String, Object> orderData = new LinkedHashMap<>(orderOpt.get());
         String tkpUid = UUID.randomUUID().toString();
+        log.info("Zadel TkpService: сгенерирован tkpUid={}", tkpUid);
         
-        // Извлекаем цены и zadelProductUid из запроса
         Map<String, Double> prices = new HashMap<>();
         Map<String, String> zadelUids = new HashMap<>();
         Map<String, Double> relevanceScores = new HashMap<>();
         
         List<Map<String, Object>> priceList = (List<Map<String, Object>>) request.get("prices");
+        log.info("Zadel TkpService: priceList={}", priceList);
         if (priceList != null) {
             for (Map<String, Object> priceItem : priceList) {
                 String productUid = (String) priceItem.get("productUid");
@@ -218,6 +243,7 @@ public class TkpService {
                 String zadelUid = (String) priceItem.get("zadelProductUid");
                 if (zadelUid != null) {
                     zadelUids.put(productUid, zadelUid);
+                    log.info("Zadel TkpService: маппинг AWMS {} -> Zadel {}", productUid, zadelUid);
                 }
                 if (priceItem.get("relevance") != null) {
                     relevanceScores.put(productUid, Double.parseDouble(priceItem.get("relevance").toString()));
@@ -225,7 +251,6 @@ public class TkpService {
             }
         }
 
-        // Формируем новые продукты с данными из номенклатуры Zadel
         List<Map<String, Object>> awmsProducts = (List<Map<String, Object>>) orderData.get("products");
         List<Map<String, Object>> newProducts = new ArrayList<>();
         double totalCost = 0;
@@ -240,7 +265,6 @@ public class TkpService {
                 totalCost += cost;
 
                 Map<String, Object> newProduct = new LinkedHashMap<>();
-                
                 newProduct.put("product_uid", productUid);
                 newProduct.put("quantity", quantity);
                 newProduct.put("price", price);
@@ -250,7 +274,9 @@ public class TkpService {
                     newProduct.put("zadel_product_uid", zadelUid);
                     try {
                         UUID zUid = UUID.fromString(zadelUid);
+                        log.info("Zadel TkpService: ищу материал Zadel по uid={}", zUid);
                         SprMaterialDTO material = nomenclatureService.getMaterial(zUid);
+                        log.info("Zadel TkpService: материал найден: {}", material.getName());
                         newProduct.put("product", material.getName() != null ? material.getName() : awmsProduct.get("product"));
                         newProduct.put("article", material.getArticle() != null ? material.getArticle() : "");
                         newProduct.put("description", material.getDescription() != null ? material.getDescription() : "");
@@ -261,6 +287,7 @@ public class TkpService {
                         newProduct.put("brand", material.getBrandName() != null ? material.getBrandName() : "");
                         newProduct.put("model", material.getModelOfBrandName() != null ? material.getModelOfBrandName() : "");
                     } catch (Exception e) {
+                        log.error("Zadel TkpService: материал не найден: {}", zadelUid, e);
                         newProduct.put("product", awmsProduct.get("product"));
                         newProduct.put("article", awmsProduct.get("article"));
                         newProduct.put("description", awmsProduct.get("description"));
@@ -272,6 +299,7 @@ public class TkpService {
                         newProduct.put("model", awmsProduct.get("model"));
                     }
                 } else {
+                    log.warn("Zadel TkpService: zadelUid не найден для productUid={}", productUid);
                     newProduct.put("product", awmsProduct.get("product"));
                     newProduct.put("article", awmsProduct.get("article"));
                     newProduct.put("description", awmsProduct.get("description"));
@@ -301,6 +329,7 @@ public class TkpService {
         Map<String, Object> tkpData = new LinkedHashMap<>();
         tkpData.put("tkp_uid", tkpUid);
         tkpData.put("order_uid", orderUid);
+        tkpData.put("ordernumber", orderData.get("ordernumber"));
         tkpData.put("tkp_number", "TKP-" + System.currentTimeMillis());
         tkpData.put("tkp_data", ZonedDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
         tkpData.put("customer", orderData.get("customer"));
@@ -316,8 +345,10 @@ public class TkpService {
         tkpData.put("products", newProducts);
 
         try {
+            log.info("Zadel TkpService: отправляю ТКП в SAAS, url={}", saasServiceUrl + "/v1/tkp/" + tkpUid);
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(tkpData, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/tkp/" + tkpUid, HttpMethod.POST, entity, String.class);
+            log.info("Zadel TkpService: SAAS принял ТКП");
 
             saveTkpLocally(tkpUid, tkpData);
 
@@ -328,25 +359,31 @@ public class TkpService {
                     .datetime(ZonedDateTime.now())
                     .build();
             tkpStatusRepository.save(tkpStatus);
+            log.info("Zadel TkpService: локально сохранён unaccept");
 
-            // ОТПРАВЛЯЕМ unaccept В SAAS
+            log.info("Zadel TkpService: отправляю unaccept в SAAS, url={}", saasServiceUrl + "/v1/tkp/" + tkpUid + "/statusinvoice");
             Map<String, Object> invoiceBody = Map.of("statusinvoice", "unaccept");
             HttpEntity<Map<String, Object>> invoiceEntity = new HttpEntity<>(invoiceBody, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/tkp/" + tkpUid + "/statusinvoice", HttpMethod.POST, invoiceEntity, String.class);
+            log.info("Zadel TkpService: SAAS принял unaccept");
 
+            log.info("Zadel TkpService: отправляю posttkpprovider в SAAS");
             Map<String, Object> reasonBody = Map.of("statusreason", "posttkpprovider");
             HttpEntity<Map<String, Object>> reasonEntity = new HttpEntity<>(reasonBody, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/orders/" + orderUid + "/statusreason", HttpMethod.POST, reasonEntity, String.class);
+            log.info("Zadel TkpService: SAAS принял posttkpprovider");
 
+            log.info("Zadel TkpService: отправляю processed в SAAS");
             Map<String, Object> statusBody = Map.of("status", "processed");
             HttpEntity<Map<String, Object>> statusEntity = new HttpEntity<>(statusBody, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/orders/" + orderUid + "/status", HttpMethod.POST, statusEntity, String.class);
+            log.info("Zadel TkpService: SAAS принял processed");
 
             orderService.receiveStatusReasonUpdate(orderUid, "posttkpprovider");
             orderService.receiveStatusUpdate(orderUid, "processed");
 
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel TkpService: ошибка отправки ТКП", e);
             throw new RuntimeException("Ошибка отправки ТКП: " + e.getMessage());
         }
 
@@ -360,6 +397,7 @@ public class TkpService {
 
     @Transactional
     public void addTrack(String orderUid, String statustrack) {
+        log.info("Zadel TkpService: addTrack() вызван, orderUid={}, statustrack={}", orderUid, statustrack);
         OrderTracking tracking = OrderTracking.builder()
                 .orderUid(orderUid)
                 .trackingStatus(statustrack)
@@ -372,48 +410,50 @@ public class TkpService {
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/orders/" + orderUid + "/statustrack", HttpMethod.POST, entity, String.class);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel TkpService: ошибка отправки трека", e);
         }
     }
 
     @Transactional
     public void cancelTkp(String tkpUid) {
+        log.info("Zadel TkpService: cancelTkp() вызван, tkpUid={}", tkpUid);
         postStatusInvoice(tkpUid, "cancelprovider");
     }
 
     @Transactional
     public void payTkp(String tkpUid) {
+        log.info("Zadel TkpService: payTkp() вызван, tkpUid={}", tkpUid);
         postStatusInvoice(tkpUid, "paid");
     }
 
     @Transactional
     public void confirmInrealise(String tkpUid) {
+        log.info("Zadel TkpService: confirmInrealise() вызван, tkpUid={}", tkpUid);
         postStatusInvoice(tkpUid, "inrealise");
     }
 
     @Transactional
     public void completeTkp(String tkpUid) {
+        log.info("Zadel TkpService: completeTkp() вызван, tkpUid={}", tkpUid);
         postStatusInvoice(tkpUid, "unpaid");
     }
 
     private void postStatusInvoice(String tkpUid, String statusinvoice) {
+        log.info("Zadel TkpService: postStatusInvoice() вызван, tkpUid={}, statusinvoice={}", tkpUid, statusinvoice);
         try {
             Map<String, Object> body = Map.of("statusinvoice", statusinvoice);
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/tkp/" + tkpUid + "/statusinvoice", HttpMethod.POST, entity, String.class);
-
             receiveTkpStatusUpdate(tkpUid, statusinvoice);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel TkpService: ошибка postStatusInvoice {}", tkpUid, e);
         }
     }
 
     private String getLatestTkpStatus(String tkpUid) {
         List<TkpStatus> statuses = tkpStatusRepository.findByTkpUidOrderByDatetimeDesc(tkpUid);
         String subStatus = statuses.stream().filter(s -> s.getSubStatus() != null).findFirst().map(TkpStatus::getSubStatus).orElse(null);
-        if (subStatus == null) return "active";
-        if ("paid".equals(subStatus) || "unpaid".equals(subStatus) || "cancelcustomer".equals(subStatus) || "cancelprovider".equals(subStatus)) return "closed";
-        return "active";
+        return ("paid".equals(subStatus) || "unpaid".equals(subStatus) || "cancelcustomer".equals(subStatus) || "cancelprovider".equals(subStatus)) ? "closed" : "active";
     }
 
     private String getLatestStatusInvoice(String tkpUid) {
@@ -432,6 +472,15 @@ public class TkpService {
         map.put("total_cost", tkp.getTotalCost());
         map.put("status", tkp.getStatus());
         map.put("statusinvoice", tkp.getStatusinvoice());
+        
+        // Добавляем номер заказа
+        String orderUid = tkp.getOrderUid();
+        if (orderUid != null) {
+            ordersListRepository.findById(orderUid).ifPresent(order -> {
+                map.put("order_number", order.getOrderNumber());
+            });
+        }
+        
         return map;
     }
 

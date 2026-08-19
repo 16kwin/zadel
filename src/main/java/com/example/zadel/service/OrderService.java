@@ -1,10 +1,11 @@
-// ЗАДЕЛ — service/OrderService.java — ПОЛНЫЙ ФАЙЛ (исправлена проверка TkpStatus — убраны cancelprovider и cancelcustomer)
+// ЗАДЕЛ — service/OrderService.java — ПОЛНЫЙ ФАЙЛ С ЛОГАМИ + формат даты
 package com.example.zadel.service;
 
 import com.example.zadel.model.*;
 import com.example.zadel.repository.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -17,6 +18,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class OrderService {
@@ -50,18 +52,20 @@ public class OrderService {
         return headers;
     }
 
-    // Читаем из локальной базы
     public List<Map<String, Object>> getActiveOrders() {
+        log.info("Zadel OrderService: getActiveOrders() вызван");
         return ordersListRepository.findByStatusIn(Arrays.asList("active", "processed"))
                 .stream().map(this::toOrderListMap).collect(Collectors.toList());
     }
 
     public List<Map<String, Object>> getClosedOrders() {
+        log.info("Zadel OrderService: getClosedOrders() вызван");
         return ordersListRepository.findByStatus("closed")
                 .stream().map(this::toOrderListMap).collect(Collectors.toList());
     }
 
     public Optional<Map<String, Object>> getOrder(String orderUid) {
+        log.info("Zadel OrderService: getOrder() вызван, orderUid={}", orderUid);
         Optional<OrdersFull> fullOpt = ordersFullRepository.findByOrderUid(orderUid);
         if (fullOpt.isPresent()) {
             try {
@@ -69,8 +73,9 @@ public class OrderService {
                 order.put("statustrack", getLatestTrackingStatus(orderUid));
                 order.put("status", getLatestStatus(orderUid));
                 order.put("statusreason", getLatestStatusReason(orderUid));
+                log.info("Zadel OrderService: заказ {}, status={}, statusreason={}, statustrack={}", 
+                    orderUid, order.get("status"), order.get("statusreason"), order.get("statustrack"));
                 
-                // Добавляем previous_statusreason — последний не-отменный статус
                 String currentReason = getLatestStatusReason(orderUid);
                 if ("cancelcustomer".equals(currentReason) || "cancelprovider".equals(currentReason)) {
                     List<OrderStatus> statuses = orderStatusRepository.findByOrderUidOrderByDatetimeDesc(orderUid);
@@ -80,15 +85,10 @@ public class OrderService {
                         .findFirst()
                         .orElse(null);
                     
-                    // Если последний статус posttkpprovider — проверяем ТКП
-                    // Нужно узнать, был ли ТКП ПОДТВЕРЖДЁН (accept), а не просто отменён
                     if ("posttkpprovider".equals(prevReason)) {
                         List<TkpList> tkpList = tkpListRepository.findByOrderUid(orderUid);
                         for (TkpList tkp : tkpList) {
-                            // Проверяем историю статусов ТКП
                             List<TkpStatus> tkpStatuses = tkpStatusRepository.findByTkpUidOrderByDatetimeDesc(tkp.getTkpUid());
-                            // accept, inrealise, paid, unpaid — только подтверждающие статусы
-                            // cancelprovider и cancelcustomer НЕ означают подтверждение
                             boolean tkpAccepted = tkpStatuses.stream()
                                 .anyMatch(s -> "accept".equals(s.getSubStatus()) 
                                     || "inrealise".equals(s.getSubStatus())
@@ -102,11 +102,12 @@ public class OrderService {
                     }
                     
                     order.put("previous_statusreason", prevReason);
+                    log.info("Zadel OrderService: заказ {} отменён, previous_statusreason={}", orderUid, prevReason);
                 }
                 
                 return Optional.of(order);
             } catch (Exception e) {
-                e.printStackTrace();
+                log.error("Zadel OrderService: ошибка парсинга заказа {}", orderUid, e);
             }
         }
         return Optional.empty();
@@ -114,6 +115,7 @@ public class OrderService {
 
     @Transactional
     public void saveOrderLocally(String orderUid, Map<String, Object> orderData, String status, String statusreason) {
+        log.info("Zadel OrderService: saveOrderLocally() вызван, orderUid={}, status={}, reason={}", orderUid, status, statusreason);
         OrdersList orderList = OrdersList.builder()
                 .orderUid(orderUid)
                 .customerId((String) orderData.get("customer"))
@@ -124,6 +126,7 @@ public class OrderService {
                 .syncedAt(ZonedDateTime.now())
                 .build();
         ordersListRepository.save(orderList);
+        log.info("Zadel OrderService: OrdersList сохранён");
 
         try {
             String json = objectMapper.writeValueAsString(orderData);
@@ -132,14 +135,15 @@ public class OrderService {
                     .orderJson(json)
                     .build();
             ordersFullRepository.save(orderFull);
+            log.info("Zadel OrderService: OrdersFull сохранён");
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel OrderService: ошибка сохранения OrdersFull {}", orderUid, e);
         }
     }
 
-    // Принимаем заказ от SAAS
     @Transactional
     public void receiveOrder(String orderUid, Map<String, Object> request) {
+        log.info("Zadel OrderService: receiveOrder() вызван, orderUid={}", orderUid);
         saveOrderLocally(orderUid, request, "active", "inprocessing");
 
         OrderStatus orderStatus = OrderStatus.builder()
@@ -149,8 +153,8 @@ public class OrderService {
                 .datetime(ZonedDateTime.now())
                 .build();
         orderStatusRepository.save(orderStatus);
+        log.info("Zadel OrderService: OrderStatus active/inprocessing сохранён");
         
-        // WebSocket уведомление
         Map<String, Object> notification = new LinkedHashMap<>();
         notification.put("order_uid", orderUid);
         notification.put("order_number", request.getOrDefault("ordernumber", ""));
@@ -158,41 +162,43 @@ public class OrderService {
         messagingTemplate.convertAndSend("/topic/orders/new", notification);
     }
 
-    // Принимаем обновления статуса от SAAS
     @Transactional
     public void receiveStatusUpdate(String orderUid, String newStatus) {
+        log.info("Zadel OrderService: receiveStatusUpdate() вызван, orderUid={}, newStatus={}", orderUid, newStatus);
         OrderStatus orderStatus = OrderStatus.builder()
                 .orderUid(orderUid)
                 .status(newStatus)
                 .datetime(ZonedDateTime.now())
                 .build();
         orderStatusRepository.save(orderStatus);
+        log.info("Zadel OrderService: OrderStatus status сохранён");
 
         ordersListRepository.findById(orderUid).ifPresent(order -> {
             order.setStatus(newStatus);
             ordersListRepository.save(order);
+            log.info("Zadel OrderService: OrdersList status обновлён");
         });
         
-        // WebSocket уведомление
         messagingTemplate.convertAndSend("/topic/orders/refresh", Map.of("order_uid", orderUid, "type", "status_update"));
     }
 
-    // Принимаем обновления statusreason от SAAS
     @Transactional
     public void receiveStatusReasonUpdate(String orderUid, String statusreason) {
+        log.info("Zadel OrderService: receiveStatusReasonUpdate() вызван, orderUid={}, statusreason={}", orderUid, statusreason);
         OrderStatus orderStatus = OrderStatus.builder()
                 .orderUid(orderUid)
                 .subStatus(statusreason)
                 .datetime(ZonedDateTime.now())
                 .build();
         orderStatusRepository.save(orderStatus);
+        log.info("Zadel OrderService: OrderStatus subStatus сохранён");
 
         ordersListRepository.findById(orderUid).ifPresent(order -> {
             order.setStatusreason(statusreason);
             ordersListRepository.save(order);
+            log.info("Zadel OrderService: OrdersList statusreason обновлён");
         });
         
-        // WebSocket уведомление
         Map<String, Object> notification = new LinkedHashMap<>();
         notification.put("order_uid", orderUid);
         notification.put("type", "statusreason_update");
@@ -207,19 +213,22 @@ public class OrderService {
 
     @Transactional
     public void takeToWork(String orderUid) {
+        log.info("Zadel OrderService: takeToWork() вызван, orderUid={}", orderUid);
         try {
             Map<String, Object> body = Map.of("statusreason", "inworkprovider");
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, createJsonHeaders());
+            log.info("Zadel OrderService: отправляю inworkprovider в SAAS");
             restTemplate.exchange(saasServiceUrl + "/v1/orders/" + orderUid + "/statusreason", HttpMethod.POST, entity, String.class);
-
+            log.info("Zadel OrderService: SAAS принял inworkprovider");
             receiveStatusReasonUpdate(orderUid, "inworkprovider");
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel OrderService: ошибка takeToWork {}", orderUid, e);
         }
     }
 
     @Transactional
     public void cancelOrder(String orderUid) {
+        log.info("Zadel OrderService: cancelOrder() вызван, orderUid={}", orderUid);
         try {
             Map<String, Object> reasonBody = Map.of("statusreason", "cancelprovider");
             HttpEntity<Map<String, Object>> reasonEntity = new HttpEntity<>(reasonBody, createJsonHeaders());
@@ -231,31 +240,21 @@ public class OrderService {
 
             receiveStatusReasonUpdate(orderUid, "cancelprovider");
             receiveStatusUpdate(orderUid, "closed");
-            
-            // WebSocket уведомление об отмене
-            Map<String, Object> notification = new LinkedHashMap<>();
-            notification.put("order_uid", orderUid);
-            notification.put("type", "order_cancelled");
-            messagingTemplate.convertAndSend("/topic/orders/cancelled", notification);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel OrderService: ошибка cancelOrder {}", orderUid, e);
         }
     }
 
     @Transactional
     public void markOrderCancelledByCustomer(String orderUid) {
+        log.info("Zadel OrderService: markOrderCancelledByCustomer() вызван, orderUid={}", orderUid);
         receiveStatusReasonUpdate(orderUid, "cancelcustomer");
         receiveStatusUpdate(orderUid, "closed");
-        
-        // WebSocket уведомление
-        Map<String, Object> notification = new LinkedHashMap<>();
-        notification.put("order_uid", orderUid);
-        notification.put("type", "order_cancelled");
-        messagingTemplate.convertAndSend("/topic/orders/cancelled", notification);
     }
 
     @Transactional
     public Map<String, Object> addTrack(String orderUid, String statustrack) {
+        log.info("Zadel OrderService: addTrack() вызван, orderUid={}, statustrack={}", orderUid, statustrack);
         OrderTracking tracking = OrderTracking.builder()
                 .orderUid(orderUid)
                 .trackingStatus(statustrack)
@@ -268,10 +267,9 @@ public class OrderService {
             HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, createJsonHeaders());
             restTemplate.exchange(saasServiceUrl + "/v1/orders/" + orderUid + "/statustrack", HttpMethod.POST, entity, String.class);
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Zadel OrderService: ошибка addTrack {}", orderUid, e);
         }
         
-        // WebSocket уведомление
         messagingTemplate.convertAndSend("/topic/orders/refresh", Map.of("order_uid", orderUid, "type", "track_update"));
 
         Map<String, Object> response = new LinkedHashMap<>();
@@ -302,7 +300,7 @@ public class OrderService {
         map.put("customer_id", order.getCustomerId());
         map.put("order_number", order.getOrderNumber());
         map.put("order_datetime", order.getOrderDatetime() != null
-                ? order.getOrderDatetime().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME) : null);
+                ? order.getOrderDatetime().format(DateTimeFormatter.ofPattern("dd.MM.yyyy-HH:mm")) : null);
         map.put("status", order.getStatus());
         map.put("statusreason", order.getStatusreason());
         map.put("statustrack", getLatestTrackingStatus(order.getOrderUid()));
